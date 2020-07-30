@@ -8,43 +8,30 @@ from elasticsearch.helpers import bulk
 def extract():
     """
     extract data from sql-db
-    :return:
     """
     connection = sqlite3.connect("db.sqlite")
     cursor = connection.cursor()
 
-    # Наверняка это пилится в один sql - запрос, но мне как-то лениво)
-
-    # Получаем все поля для индекса, кроме списка актеров и сценаристов, для них только id
+    # Получаем все поля для индекса, кроме списка сценаристов
     cursor.execute("""
-        select id, imdb_rating, genre, title, plot, director,
-        -- comma-separated actor_id's
-        (
-            select GROUP_CONCAT(actor_id) from
-            (
-                select actor_id
-                from movie_actors
-                where movie_id = movies.id
-            )
-        ),
-
-        max(writer, writers)
-        from movies
+        SELECT movies.id, movies.title, movies.genre, movies.plot, movies.imdb_rating, movies.director,
+               movies.writer, movies.writers, GROUP_CONCAT(actors.id), GROUP_CONCAT(actors.name)
+        FROM movies JOIN movie_actors ON movies.id = movie_actors.movie_id
+                    JOIN actors ON movie_actors.actor_id = actors.id
+        GROUP BY movies.id
     """)
 
     raw_data = cursor.fetchall()
 
-    # cursor.execute('pragma table_info(movies)')
-    # pprint(cursor.fetchall())
+    # Получаем всех сценаристов
+    writers_dict = {row[0]: row[1] for row in cursor.execute('SELECT id, name FROM writers WHERE name != "N/A"')}
 
-    # Нужны для соответсвия идентификатора и человекочитаемого названия
-    actors = {row[0]: row[1] for row in cursor.execute('select * from actors where name != "N/A"')}
-    writers = {row[0]: row[1] for row in cursor.execute('select * from writers where name != "N/A"')}
+    connection.close()
 
-    return actors, writers, raw_data
+    return _transform(raw_data, writers_dict)
 
 
-def transform(__actors, __writers, __raw_data):
+def _transform(raw_data, writers_dict):
     """
 
     :param __actors:
@@ -53,34 +40,34 @@ def transform(__actors, __writers, __raw_data):
     :return:
     """
     documents_list = []
-    for movie_info in __raw_data:
+    for movie_info in raw_data:
         # Разыменование списка
-        movie_id, imdb_rating, genre, title, description, director, raw_actors, raw_writers = movie_info
+        movie_id, title, genre, plot, imdb_rating, director, writer, writers, actors_ids, actors_names = movie_info
 
-        if raw_writers[0] == '[':
-            parsed = json.loads(raw_writers)
-            new_writers = ','.join([writer_row['id'] for writer_row in parsed])
+        if writers and writers[0] == '[':
+            parsed = json.loads(writers)
+            new_writers = [writer_row['id'] for writer_row in parsed]
         else:
-            new_writers = raw_writers
+            new_writers = [writer]
 
-        writers_list = [(writer_id, __writers.get(writer_id)) for writer_id in new_writers.split(',')]
-        actors_list = [(actor_id, __actors.get(int(actor_id))) for actor_id in raw_actors.split(',')]
+        writers_list = [(writer_id, writers_dict.get(writer_id)) for writer_id in new_writers]
+        actors_list = zip(actors_ids.split(','), actors_names.split(','))
 
         document = {
             "_index": "movies",
             "_id": movie_id,
             "id": movie_id,
-            "imdb_rating": imdb_rating,
+            "imdb_rating": float(imdb_rating) if imdb_rating != 'N/A' else None,
             "genre": genre.split(', '),
             "title": title,
-            "description": description,
-            "director": director,
+            "description": plot if plot != 'N/A' else None,
+            "director": [director] if director != 'N/A' else None,
             "actors": [
                 {
-                    "id": actor[0],
+                    "id": int(actor[0]),
                     "name": actor[1]
                 }
-                for actor in set(actors_list) if actor[1]
+                for actor in set(actors_list) if actor[1] != 'N/A'
             ],
             "writers": [
                 {
@@ -91,16 +78,8 @@ def transform(__actors, __writers, __raw_data):
             ]
         }
 
-        for key in document.keys():
-            if document[key] == 'N/A':
-                # print('hehe')
-                document[key] = None
-
-        document['actors_names'] = ", ".join([actor["name"] for actor in document['actors'] if actor]) or None
-        document['writers_names'] = ", ".join([writer["name"] for writer in document['writers'] if writer]) or None
-
-        import pprint
-        pprint.pprint(document)
+        document['actors_names'] = [actor['name'] for actor in document['actors']]
+        document['writers_names'] = [writer['name'] for writer in document['writers']]
 
         documents_list.append(document)
 
@@ -113,11 +92,13 @@ def load(acts):
     :param acts:
     :return:
     """
-    es = Elasticsearch([{'host': '192.168.1.252', 'port': 9200}])
+    es = Elasticsearch([{'host': 'localhost', 'port': 9200}])
     bulk(es, acts)
+
+    es.close()
 
     return True
 
 
 if __name__ == '__main__':
-    load(transform(*extract()))
+    load(extract())
